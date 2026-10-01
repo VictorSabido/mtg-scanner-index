@@ -60,6 +60,6 @@ jobs:
             --notes "Artwork embeddings (art_embed_v1) for $COUNT illustrations, built from Scryfall bulk data." \
             --latest
           # Keep the 3 most recent index releases (the `prices` release is managed by build-prices.yml).
-          gh release list --limit 100 --json tagName --jq '[.[] | select(.tagName != "prices")][3:][].tagName' | while read -r tag; do
+          gh release list --limit 100 --json tagName --jq '[.[] | select(.tagName != "prices" and .tagName != "meta")][3:][].tagName' | while read -r tag; do
             gh release delete "$tag" --yes --cleanup-tag
           done

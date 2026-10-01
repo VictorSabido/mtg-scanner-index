@@ -1,0 +1,44 @@
+# Weekly offline card metadata (every printing in every language) from Scryfall bulk data,
+# published to the fixed `meta` release (never latest). The app downloads
+# releases/download/meta/meta.tsv.gz when its copy is more than a week old.
+name: Build meta
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "37 5 * * 1" # weekly, Monday
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-meta
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Build meta
+        run: python build_meta.py --out dist/meta.tsv.gz
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view meta >/dev/null 2>&1; then
+            gh release create meta --title "Card metadata" \
+              --notes "Every paper printing in every language (set, number, id, rarity, finishes, printed name) from Scryfall bulk data. Weekly." \
+              --latest=false
+          fi
+          gh release upload meta dist/meta.tsv.gz --clobber
