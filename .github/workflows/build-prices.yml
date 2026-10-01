@@ -1,0 +1,44 @@
+# Daily price table from Scryfall bulk data, published to the fixed `prices` release
+# (never marked latest, so releases/latest keeps pointing at the artwork index).
+# The app downloads releases/download/prices/prices.json.gz once a day.
+name: Build prices
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "43 6 * * *" # daily; Scryfall refreshes prices once a day
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-prices
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install deps
+        run: pip install requests
+
+      - name: Build prices
+        run: python build_prices.py --out dist/prices.json.gz
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view prices >/dev/null 2>&1; then
+            gh release create prices --title "Daily prices" \
+              --notes "Daily card prices (EUR/USD, cents) from Scryfall bulk data, keyed by set and collector number." \
+              --latest=false
+          fi
+          gh release upload prices dist/prices.json.gz --clobber
