@@ -1,0 +1,52 @@
+# Rebuilds the artwork index from Scryfall bulk data and publishes it as the latest release.
+# The app downloads releases/latest/download/manifest.json (+ the files it lists).
+name: Build index
+
+on:
+  workflow_dispatch:
+    inputs:
+      limit:
+        description: "Only the first N illustrations (0 = all; for testing)"
+        default: "0"
+  schedule:
+    - cron: "17 4 * * 1" # weekly, Monday 04:17 UTC
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-index
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Build index
+        run: python build_index.py --model art_embed_v1.onnx --out dist --workers 16 --limit "${{ github.event.inputs.limit || '0' }}"
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          VERSION=$(python -c "import json;print(json.load(open('dist/manifest.json'))['version'])")
+          COUNT=$(python -c "import json;print(json.load(open('dist/manifest.json'))['count'])")
+          gh release create "v$VERSION" dist/manifest.json dist/vectors.bin.gz dist/cards.tsv.gz \
+            --title "Index $VERSION ($COUNT illustrations)" \
+            --notes "Artwork embeddings (art_embed_v1) for $COUNT illustrations, built from Scryfall bulk data." \
+            --latest
+          # Keep the 3 most recent releases.
+          gh release list --limit 100 --json tagName --jq '.[3:][].tagName' | while read -r tag; do
+            gh release delete "$tag" --yes --cleanup-tag
+          done
