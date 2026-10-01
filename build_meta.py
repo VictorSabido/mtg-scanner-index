@@ -5,7 +5,8 @@ With it the app builds the card object for a recognized printing — and picks i
 language from the OCR'd title — without calling the API. Gameplay data changes rarely, so a
 weekly rebuild is enough (Scryfall's own advice).
 
-Output (gzip, tab-separated, one record per line, sets first):
+Output: one gzip file per language, meta-<lang>.tsv.gz (the app downloads only the languages
+it needs), tab-separated, one record per line; the set names (S lines) go in meta-en:
   S \t set \t set_name
   C \t set \t collector_number \t lang \t scryfall_id \t rarity \t finishes \t name
     rarity    c/u/r/m/s/b (common, uncommon, rare, mythic, special, bonus)
@@ -13,7 +14,7 @@ Output (gzip, tab-separated, one record per line, sets first):
     name      English name for `en` rows; the printed (localized) name otherwise
 Only paper cards in the layouts the artwork index covers.
 
-Usage: python build_meta.py --out dist/meta.tsv.gz
+Usage: python build_meta.py --out dist
 """
 from __future__ import annotations
 
@@ -48,7 +49,7 @@ def printed(c: dict) -> str:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out", required=True, help="output directory")
     ap.add_argument("--cache", default="bulk-cache")
     args = ap.parse_args()
 
@@ -86,18 +87,20 @@ def main() -> None:
                 clean(c["name"] if lang == "en" else printed(c)),
             ))
 
-    rows.sort(key=lambda r: (r[0], r[1], r[2] != "en", r[2]))
-    os.makedirs(os.path.dirname(args.out) or ".", exist_ok=True)
-    with gzip.open(args.out, "wt", encoding="utf-8", compresslevel=9) as f:
-        for code, name in sorted(sets.items()):
-            f.write(f"S\t{code}\t{clean(name)}\n")
-        for r in rows:
-            f.write("C\t" + "\t".join(r) + "\n")
-    langs: dict[str, int] = {}
+    rows.sort(key=lambda r: (r[0], r[1], r[2]))
+    by_lang: dict[str, list[tuple]] = {}
     for r in rows:
-        langs[r[2]] = langs.get(r[2], 0) + 1
-    print(f"{len(rows)} printings in {len(sets)} sets → {args.out} "
-          f"({os.path.getsize(args.out) / 1e6:.2f} MB); by lang: {dict(sorted(langs.items()))}")
+        by_lang.setdefault(r[2], []).append(r)
+    os.makedirs(args.out, exist_ok=True)
+    for lang, lang_rows in sorted(by_lang.items()):
+        out = os.path.join(args.out, f"meta-{lang}.tsv.gz")
+        with gzip.open(out, "wt", encoding="utf-8", compresslevel=9) as f:
+            if lang == "en":
+                for code, name in sorted(sets.items()):
+                    f.write(f"S\t{code}\t{clean(name)}\n")
+            for r in lang_rows:
+                f.write("C\t" + "\t".join(r) + "\n")
+        print(f"{lang}: {len(lang_rows)} printings → {out} ({os.path.getsize(out) / 1e6:.2f} MB)")
 
 
 if __name__ == "__main__":
