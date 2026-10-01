@@ -16,6 +16,7 @@ Outputs (in --out):
   cards.tsv.gz    one line per row (same order):
                     illustration_id \t name \t scryfall_id \t set \t collector_number \t lang \t printings
                   printings = comma list of "set:collector_number:scryfall_id" sharing the illustration
+                  kind = "art" (art_crop) or "card" (whole card, for split/battle/saga/full-art/borderless)
 
 Incremental mode (--reuse DIR with a previous release): rows of illustrations already in the
 previous index are copied as-is and its PCA basis is kept, so only new artworks are downloaded
@@ -47,6 +48,14 @@ INPUT = 256
 DIM = 256
 USER_AGENT = "MTGScannerIndexBuilder/1.0 (github.com/VictorSabido/mtg-scanner-index)"
 SKIP_LAYOUTS = {"art_series", "token", "double_faced_token", "emblem", "vanguard", "scheme", "planar"}
+# Odd artworks that showed up as false top-1 "hubs" in the eval and that nobody scans.
+HUB_SETS = {"cmb1", "cmb2"}
+HUB_NAMES = {"Double-Faced Substitute Card"}
+# Layouts / frames whose art isn't where the standard art boxes look: index the whole card too
+# (the app also embeds the full warped card).
+FULL_CARD_LAYOUTS = {"split", "battle", "flip", "saga", "class", "case", "aftermath"}
+# Fraction trimmed from each side of Scryfall's full-card image (rounded corners / border).
+CARD_MARGIN = 0.02
 
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json;q=0.9,*/*;q=0.8"})
@@ -89,6 +98,10 @@ def usable(card: dict) -> bool:
         return False
     if "paper" not in (card.get("games") or []):
         return False
+    if card.get("set") in HUB_SETS or card.get("name") in HUB_NAMES:
+        return False
+    if "playtest" in (card.get("promo_types") or []):
+        return False
     face = front(card)
     return bool(face.get("illustration_id") or card.get("illustration_id")) and bool(
         (face.get("image_uris") or {}).get("art_crop")
@@ -97,6 +110,27 @@ def usable(card: dict) -> bool:
 
 def illustration_id(card: dict) -> str:
     return front(card).get("illustration_id") or card.get("illustration_id") or ""
+
+
+def needs_full_card(card: dict) -> bool:
+    return bool(
+        card.get("layout") in FULL_CARD_LAYOUTS
+        or "Battle" in (front(card).get("type_line") or card.get("type_line") or "")
+        or card.get("full_art")
+        or card.get("border_color") == "borderless"
+    ) and bool((front(card).get("image_uris") or {}).get("normal"))
+
+
+def image_for(card: dict, kind: str) -> tuple[str, bool]:
+    """(url, trim margins) for an index row of the given kind ('art' or 'card')."""
+    uris = front(card)["image_uris"]
+    return (uris["art_crop"], False) if kind == "art" else (uris["normal"], True)
+
+
+def trim(img: np.ndarray) -> np.ndarray:
+    h, w = img.shape[:2]
+    dy, dx = int(h * CARD_MARGIN), int(w * CARD_MARGIN)
+    return img[dy : h - dy, dx : w - dx]
 
 
 def embed(net: cv2.dnn.Net, bgr: np.ndarray) -> np.ndarray:
@@ -147,7 +181,11 @@ def load_previous(path: str) -> dict | None:
     comps = np.frombuffer(raw, "<f4", dim * in_dim, o).reshape(dim, in_dim).copy(); o += dim * in_dim * 4
     scale = np.frombuffer(raw, "<f4", count, o); o += count * 4
     rows = np.frombuffer(raw, np.int8, count * dim, o).reshape(count, dim)
-    ids = [line.split("\t", 1)[0] for line in gzip.open(tsv, "rt", encoding="utf-8").read().splitlines()]
+    # Row key = illustration id + kind (column 8; absent in older releases = 'art').
+    ids = []
+    for line in gzip.open(tsv, "rt", encoding="utf-8").read().splitlines():
+        f = line.split("\t")
+        ids.append(f"{f[0]}|{f[7] if len(f) > 7 else 'art'}")
     return {
         "version": manifest.get("version"),
         "mean": mean,
@@ -177,7 +215,8 @@ def main() -> None:
             printings[illustration_id(c)].append(f"{c['set']}:{c['collector_number']}:{c['id']}")
     if args.limit:
         arts = arts[: args.limit]
-    print(f"{len(arts)} illustrations", flush=True)
+    items = [(c, "art") for c in arts] + [(c, "card") for c in arts if needs_full_card(c)]
+    print(f"{len(arts)} illustrations, {len(items)} index rows", flush=True)
 
     net = cv2.dnn.readNetFromONNX(args.model)
     model_dim = embed(net, np.zeros((64, 64, 3), np.uint8)).shape[0]
@@ -187,18 +226,18 @@ def main() -> None:
         prev = None
     reused: dict[int, tuple[float, np.ndarray]] = {}
     if prev:
-        for i, c in enumerate(arts):
-            hit = prev["rows"].get(illustration_id(c))
+        for i, (c, kind) in enumerate(items):
+            hit = prev["rows"].get(f"{illustration_id(c)}|{kind}")
             if hit is not None:
                 reused[i] = hit
         print(f"reusing {len(reused)} rows from previous index {prev['version']}", flush=True)
 
-    vecs: list[np.ndarray | None] = [None] * len(arts)
-    todo = [i for i in range(len(arts)) if i not in reused]
-    print(f"embedding {len(todo)} illustrations", flush=True)
+    vecs: list[np.ndarray | None] = [None] * len(items)
+    todo = [i for i in range(len(items)) if i not in reused]
+    print(f"embedding {len(todo)} rows", flush=True)
 
     def work(i: int) -> tuple[int, bytes | None]:
-        return i, fetch(front(arts[i])["image_uris"]["art_crop"])
+        return i, fetch(image_for(*items[i])[0])
 
     done = 0
     t0 = time.time()
@@ -208,14 +247,14 @@ def main() -> None:
             if data:
                 img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
                 if img is not None:
-                    vecs[i] = embed(net, img)
+                    vecs[i] = embed(net, trim(img) if image_for(*items[i])[1] else img)
             if done % 1000 == 0:
                 rate = done / (time.time() - t0)
                 print(f"{done}/{len(todo)}  {rate:.1f}/s", flush=True)
 
-    keep = [i for i in range(len(arts)) if i in reused or vecs[i] is not None]
+    keep = [i for i in range(len(items)) if i in reused or vecs[i] is not None]
     fresh = [i for i in keep if i not in reused]
-    print(f"index rows {len(keep)}/{len(arts)} ({len(fresh)} newly embedded)", flush=True)
+    print(f"index rows {len(keep)}/{len(items)} ({len(fresh)} newly embedded)", flush=True)
 
     if prev:
         mean, comps = prev["mean"], prev["comps"]
@@ -256,12 +295,12 @@ def main() -> None:
     tsv_path = os.path.join(args.out, "cards.tsv.gz")
     with gzip.open(tsv_path, "wt", encoding="utf-8", compresslevel=6) as f:
         for i in keep:
-            c = arts[i]
+            c, kind = items[i]
             ill = illustration_id(c)
             name = c["name"].replace("\t", " ")
             prints = ",".join(printings.get(ill) or [f"{c['set']}:{c['collector_number']}:{c['id']}"])
             f.write(
-                "\t".join([ill, name, c["id"], c["set"], c["collector_number"], c.get("lang", "en"), prints])
+                "\t".join([ill, name, c["id"], c["set"], c["collector_number"], c.get("lang", "en"), prints, kind])
                 + "\n"
             )
 
