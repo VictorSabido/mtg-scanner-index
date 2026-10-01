@@ -52,7 +52,7 @@ def main():
     s = requests.Session(); s.headers["User-Agent"] = UA
     rng = random.Random(a.seed)
     sample = rng.sample(range(len(lines)), a.n)
-    top1 = top5 = 0; tops = []; seconds = []; fails = []; ms = []
+    top1 = top5 = 0; tops = []; seconds = []; fails = []; ms = []; decisions = []
     for k, r in enumerate(sample):
         sid = lines[r].split("\t")[2]
         time.sleep(0.1)  # Scryfall API: ~10 req/s
@@ -74,6 +74,7 @@ def main():
         ms.append((time.time() - t) * 1000)
         o = np.argsort(-best)[:5]
         top1 += o[0] == r; top5 += r in o
+        decisions.append((float(best[o[0]]), float(best[o[0]] - best[o[1]]), bool(o[0] == r)))
         tops.append(best[o[0]] if o[0] == r else np.nan); seconds.append(best[o[1]])
         if o[0] != r:
             fails.append(f"{lines[r].split(chr(9))[1]} ({lines[r].split(chr(9))[3]}) -> {lines[o[0]].split(chr(9))[1]} ({lines[o[0]].split(chr(9))[3]}) {best[o[0]]:.3f} vs true {best[r]:.3f}")
@@ -85,6 +86,14 @@ def main():
     print("correct top1 score p5/p50/p95:", np.percentile(t, [5, 50, 95]).round(3))
     print("runner-up score p50/p95/p99:", np.percentile(seconds, [50, 95, 99]).round(3))
     print(f"search+embed ms (runner CPU) p50={np.median(ms):.0f}")
+    print("\nFAST PATH (accept without OCR when score>=S and margin>=M):")
+    print("   S     M   coverage  wrong-adds")
+    for S in (0.5, 0.55, 0.6, 0.65, 0.7):
+        for M in (0.04, 0.06, 0.08, 0.1, 0.12, 0.15):
+            acc = [ok for sc, mg, ok in decisions if sc >= S and mg >= M]
+            if acc:
+                bad = len(acc) - sum(acc)
+                print(f"  {S:.2f}  {M:.2f}  {100 * len(acc) / n:5.1f}%   {bad:3d} ({100 * bad / len(acc):.2f}%)")
     print("\nFAILURES:"); print("\n".join(fails))
 
 
