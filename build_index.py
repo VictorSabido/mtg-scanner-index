@@ -17,8 +17,12 @@ Outputs (in --out):
                     illustration_id \t name \t scryfall_id \t set \t collector_number \t lang \t printings
                   printings = comma list of "set:collector_number:scryfall_id" sharing the illustration
 
+Incremental mode (--reuse DIR with a previous release): rows of illustrations already in the
+previous index are copied as-is and its PCA basis is kept, so only new artworks are downloaded
+and embedded. Use a full build (no --reuse) occasionally to refit PCA / refresh changed images.
+
 Usage:
-  python scripts/index/build_index.py --model path/to/art_embed_v1.onnx --out dist [--limit 500]
+  python scripts/index/build_index.py --model path/to/art_embed_v1.onnx --out dist [--limit 500] [--reuse prev]
 """
 from __future__ import annotations
 
@@ -124,6 +128,36 @@ def sha256(path: str) -> str:
     return h.hexdigest()
 
 
+def load_previous(path: str) -> dict | None:
+    """Rows (scale, int8 vector) keyed by illustration id + PCA basis of a previous release."""
+    vec = os.path.join(path, "vectors.bin.gz")
+    tsv = os.path.join(path, "cards.tsv.gz")
+    man = os.path.join(path, "manifest.json")
+    if not (os.path.exists(vec) and os.path.exists(tsv) and os.path.exists(man)):
+        print("no previous index to reuse: full build", flush=True)
+        return None
+    manifest = json.load(open(man, encoding="utf-8"))
+    if manifest.get("model") != MODEL_ID or manifest.get("format") != 1:
+        print("previous index built with another model/format: full build", flush=True)
+        return None
+    raw = gzip.open(vec).read()
+    _, count, in_dim, dim = struct.unpack("<4I", raw[4:20])
+    o = 20
+    mean = np.frombuffer(raw, "<f4", in_dim, o).copy(); o += in_dim * 4
+    comps = np.frombuffer(raw, "<f4", dim * in_dim, o).reshape(dim, in_dim).copy(); o += dim * in_dim * 4
+    scale = np.frombuffer(raw, "<f4", count, o); o += count * 4
+    rows = np.frombuffer(raw, np.int8, count * dim, o).reshape(count, dim)
+    ids = [line.split("\t", 1)[0] for line in gzip.open(tsv, "rt", encoding="utf-8").read().splitlines()]
+    return {
+        "version": manifest.get("version"),
+        "mean": mean,
+        "comps": comps,
+        "in_dim": in_dim,
+        "dim": dim,
+        "rows": {ill: (float(scale[k]), rows[k].copy()) for k, ill in enumerate(ids)},
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -131,6 +165,7 @@ def main() -> None:
     ap.add_argument("--cache", default=".cache")
     ap.add_argument("--limit", type=int, default=0, help="only the first N illustrations (testing)")
     ap.add_argument("--workers", type=int, default=24)
+    ap.add_argument("--reuse", default="", help="dir with a previous release to build incrementally")
     args = ap.parse_args()
     os.makedirs(args.out, exist_ok=True)
     os.makedirs(args.cache, exist_ok=True)
@@ -145,7 +180,22 @@ def main() -> None:
     print(f"{len(arts)} illustrations", flush=True)
 
     net = cv2.dnn.readNetFromONNX(args.model)
+    model_dim = embed(net, np.zeros((64, 64, 3), np.uint8)).shape[0]
+    prev = load_previous(args.reuse) if args.reuse else None
+    if prev and prev["in_dim"] != model_dim:
+        print(f"previous index has {prev['in_dim']}-d features, model gives {model_dim}: full build", flush=True)
+        prev = None
+    reused: dict[int, tuple[float, np.ndarray]] = {}
+    if prev:
+        for i, c in enumerate(arts):
+            hit = prev["rows"].get(illustration_id(c))
+            if hit is not None:
+                reused[i] = hit
+        print(f"reusing {len(reused)} rows from previous index {prev['version']}", flush=True)
+
     vecs: list[np.ndarray | None] = [None] * len(arts)
+    todo = [i for i in range(len(arts)) if i not in reused]
+    print(f"embedding {len(todo)} illustrations", flush=True)
 
     def work(i: int) -> tuple[int, bytes | None]:
         return i, fetch(front(arts[i])["image_uris"]["art_crop"])
@@ -153,7 +203,7 @@ def main() -> None:
     done = 0
     t0 = time.time()
     with cf.ThreadPoolExecutor(args.workers) as pool:
-        for i, data in pool.map(work, range(len(arts))):
+        for i, data in pool.map(work, todo):
             done += 1
             if data:
                 img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
@@ -161,27 +211,43 @@ def main() -> None:
                     vecs[i] = embed(net, img)
             if done % 1000 == 0:
                 rate = done / (time.time() - t0)
-                print(f"{done}/{len(arts)}  {rate:.1f}/s", flush=True)
+                print(f"{done}/{len(todo)}  {rate:.1f}/s", flush=True)
 
-    keep = [i for i, v in enumerate(vecs) if v is not None]
-    print(f"embedded {len(keep)}/{len(arts)}", flush=True)
-    x = np.stack([vecs[i] for i in keep]).astype(np.float32)
-    # L2-normalize raw features before PCA so scale differences don't dominate.
-    x /= np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
+    keep = [i for i in range(len(arts)) if i in reused or vecs[i] is not None]
+    fresh = [i for i in keep if i not in reused]
+    print(f"index rows {len(keep)}/{len(arts)} ({len(fresh)} newly embedded)", flush=True)
 
-    mean = x.mean(axis=0)
-    dim = min(DIM, x.shape[0], x.shape[1])
-    _, _, vt = np.linalg.svd(x - mean, full_matrices=False)
-    comps = vt[:dim].astype(np.float32)  # (dim, inDim)
-    y = (x - mean) @ comps.T
-    y /= np.linalg.norm(y, axis=1, keepdims=True) + 1e-12
-    scale = np.abs(y).max(axis=1) / 127.0
-    q = np.clip(np.round(y / scale[:, None]), -127, 127).astype(np.int8)
+    if prev:
+        mean, comps = prev["mean"], prev["comps"]
+        in_dim, dim = prev["in_dim"], prev["dim"]
+    else:
+        x = np.stack([vecs[i] for i in fresh]).astype(np.float32)
+        # L2-normalize raw features before PCA so scale differences don't dominate.
+        x /= np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
+        mean = x.mean(axis=0)
+        in_dim = x.shape[1]
+        dim = min(DIM, x.shape[0], in_dim)
+        _, _, vt = np.linalg.svd(x - mean, full_matrices=False)
+        comps = vt[:dim].astype(np.float32)  # (dim, inDim)
+
+    new_scale: dict[int, float] = {}
+    new_q: dict[int, np.ndarray] = {}
+    if fresh:
+        x = np.stack([vecs[i] for i in fresh]).astype(np.float32)
+        x /= np.linalg.norm(x, axis=1, keepdims=True) + 1e-12
+        y = (x - mean) @ comps.T
+        y /= np.linalg.norm(y, axis=1, keepdims=True) + 1e-12
+        sc = np.abs(y).max(axis=1) / 127.0
+        qq = np.clip(np.round(y / sc[:, None]), -127, 127).astype(np.int8)
+        for j, i in enumerate(fresh):
+            new_scale[i], new_q[i] = float(sc[j]), qq[j]
+    scale = np.array([reused[i][0] if i in reused else new_scale[i] for i in keep], dtype=np.float32)
+    q = np.stack([reused[i][1] if i in reused else new_q[i] for i in keep]).astype(np.int8)
 
     vec_path = os.path.join(args.out, "vectors.bin.gz")
     with gzip.open(vec_path, "wb", compresslevel=6) as f:
         f.write(b"MTGI")
-        f.write(struct.pack("<4I", 1, len(keep), x.shape[1], dim))
+        f.write(struct.pack("<4I", 1, len(keep), in_dim, dim))
         f.write(mean.astype("<f4").tobytes())
         f.write(comps.astype("<f4").tobytes())
         f.write(scale.astype("<f4").tobytes())

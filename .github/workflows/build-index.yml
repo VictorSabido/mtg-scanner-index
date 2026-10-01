@@ -8,6 +8,10 @@ on:
       limit:
         description: "Only the first N illustrations (0 = all; for testing)"
         default: "0"
+      full:
+        description: "Full rebuild (refit PCA, re-download every image)"
+        type: boolean
+        default: false
   schedule:
     - cron: "17 4 * * 1" # weekly, Monday 04:17 UTC
 
@@ -33,8 +37,17 @@ jobs:
       - name: Install deps
         run: pip install -r requirements.txt
 
+      - name: Previous release (incremental build)
+        if: ${{ github.event.inputs.full != 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download --pattern '*' --dir prev || echo "no previous release"
+
       - name: Build index
-        run: python build_index.py --model art_embed_v1.onnx --out dist --workers 16 --limit "${{ github.event.inputs.limit || '0' }}"
+        run: |
+          REUSE=""
+          if [ -f prev/manifest.json ]; then REUSE="--reuse prev"; fi
+          python build_index.py --model art_embed_v1.onnx --out dist --workers 16             --limit "${{ github.event.inputs.limit || '0' }}" $REUSE
 
       - name: Publish release
         env:
