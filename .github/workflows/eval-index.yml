@@ -1,0 +1,30 @@
+# Benchmarks the latest published index with phone-like degraded card images.
+name: Eval index
+
+on:
+  workflow_dispatch:
+    inputs:
+      n:
+        description: "Number of random illustrations to test"
+        default: "400"
+
+jobs:
+  eval:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - name: Download latest index
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release download --pattern '*' --dir dist
+      - name: Evaluate
+        run: python eval_index.py --model art_embed_v1.onnx --index dist --n "${{ github.event.inputs.n }}" | tee eval.txt
+      - name: Summary
+        run: |
+          { echo '```'; cat eval.txt; echo '```'; } >> "$GITHUB_STEP_SUMMARY"
