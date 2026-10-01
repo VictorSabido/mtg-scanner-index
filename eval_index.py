@@ -3,9 +3,9 @@ Accuracy benchmark of the published index, simulating the phone pipeline (IndexS
 CardScannerView.identifyBest + recognize.ts):
 
 full-card image -> 744x1039 "warp" -> perspective jitter, blur, exposure, noise, white balance
-(+ a share of cards upside down) -> 4 crops (3 art boxes + whole card) -> embed -> PCA/int8
+(+ a share of cards upside down) -> 3 art-box crops -> embed -> PCA/int8
 search -> best per row; retry rotated 180° when the best score < RETRY_BELOW -> collapse rows
-of the same illustration (art + whole-card rows) -> top-1 / margin vs runner-up.
+of the same illustration (art + per-box rows of special layouts) -> top-1 / margin vs runner-up.
 
 Usage: python eval_index.py --model art_embed_v1.onnx --index dist --n 400
 """
@@ -16,7 +16,7 @@ import numpy as np
 import requests
 
 UA = "MTGScannerIndexEval/1.0 (github.com/VictorSabido/mtg-scanner-index)"
-BOXES = [(0.08, 0.11, 0.84, 0.44), (0.12, 0.10, 0.76, 0.42), (0.06, 0.09, 0.88, 0.48), (0.02, 0.02, 0.96, 0.96)]
+BOXES = [(0.08, 0.11, 0.84, 0.44), (0.12, 0.10, 0.76, 0.42), (0.06, 0.09, 0.88, 0.48)]
 RETRY_BELOW = 0.5
 
 

@@ -16,7 +16,7 @@ Outputs (in --out):
   cards.tsv.gz    one line per row (same order):
                     illustration_id \t name \t scryfall_id \t set \t collector_number \t lang \t printings
                   printings = comma list of "set:collector_number:scryfall_id" sharing the illustration
-                  kind = "art" (art_crop) or "card" (whole card, for split/battle/saga/full-art/borderless)
+                  kind = "art" (art_crop) or "b0".."b2" (app art box N on the full card, special layouts)
 
 Incremental mode (--reuse DIR with a previous release): rows of illustrations already in the
 previous index are copied as-is and its PCA basis is kept, so only new artworks are downloaded
@@ -51,11 +51,13 @@ SKIP_LAYOUTS = {"art_series", "token", "double_faced_token", "emblem", "vanguard
 # Odd artworks that showed up as false top-1 "hubs" in the eval and that nobody scans.
 HUB_SETS = {"cmb1", "cmb2"}
 HUB_NAMES = {"Double-Faced Substitute Card"}
-# Layouts / frames whose art isn't where the standard art boxes look: index the whole card too
-# (the app also embeds the full warped card).
+# Layouts / frames whose art isn't where the standard art boxes look. For these we also index
+# what each of the app's art boxes sees on the full card image (kinds b0/b1/b2), so a phone
+# crop is compared with exactly the same region. (A whole-card crop was tried and rejected:
+# full cards all look alike — frame, text box — and became false-match hubs: 46% top-1.)
 FULL_CARD_LAYOUTS = {"split", "battle", "flip", "saga", "class", "case", "aftermath"}
-# Fraction trimmed from each side of Scryfall's full-card image (rounded corners / border).
-CARD_MARGIN = 0.02
+# Must match ArtEmbedder.ART_BOXES (x, y, w, h fractions of the card).
+ART_BOXES = [(0.08, 0.11, 0.84, 0.44), (0.12, 0.10, 0.76, 0.42), (0.06, 0.09, 0.88, 0.48)]
 
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json;q=0.9,*/*;q=0.8"})
@@ -121,16 +123,18 @@ def needs_full_card(card: dict) -> bool:
     ) and bool((front(card).get("image_uris") or {}).get("normal"))
 
 
-def image_for(card: dict, kind: str) -> tuple[str, bool]:
-    """(url, trim margins) for an index row of the given kind ('art' or 'card')."""
+def image_url(card: dict, kind: str) -> str:
     uris = front(card)["image_uris"]
-    return (uris["art_crop"], False) if kind == "art" else (uris["normal"], True)
+    return uris["art_crop"] if kind == "art" else uris["normal"]
 
 
-def trim(img: np.ndarray) -> np.ndarray:
-    h, w = img.shape[:2]
-    dy, dx = int(h * CARD_MARGIN), int(w * CARD_MARGIN)
-    return img[dy : h - dy, dx : w - dx]
+def region(img: np.ndarray, kind: str) -> np.ndarray:
+    """The pixels an index row embeds: the whole art_crop, or art box N of the full card."""
+    if kind == "art":
+        return img
+    x, y, w, h = ART_BOXES[int(kind[1:])]
+    H, W = img.shape[:2]
+    return img[int(H * y) : int(H * (y + h)), int(W * x) : int(W * (x + w))]
 
 
 def embed(net: cv2.dnn.Net, bgr: np.ndarray) -> np.ndarray:
@@ -215,7 +219,9 @@ def main() -> None:
             printings[illustration_id(c)].append(f"{c['set']}:{c['collector_number']}:{c['id']}")
     if args.limit:
         arts = arts[: args.limit]
-    items = [(c, "art") for c in arts] + [(c, "card") for c in arts if needs_full_card(c)]
+    items = [(c, "art") for c in arts] + [
+        (c, f"b{b}") for c in arts if needs_full_card(c) for b in range(len(ART_BOXES))
+    ]
     print(f"{len(arts)} illustrations, {len(items)} index rows", flush=True)
 
     net = cv2.dnn.readNetFromONNX(args.model)
@@ -237,7 +243,7 @@ def main() -> None:
     print(f"embedding {len(todo)} rows", flush=True)
 
     def work(i: int) -> tuple[int, bytes | None]:
-        return i, fetch(image_for(*items[i])[0])
+        return i, fetch(image_url(*items[i]))
 
     done = 0
     t0 = time.time()
@@ -247,7 +253,7 @@ def main() -> None:
             if data:
                 img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
                 if img is not None:
-                    vecs[i] = embed(net, trim(img) if image_for(*items[i])[1] else img)
+                    vecs[i] = embed(net, region(img, items[i][1]))
             if done % 1000 == 0:
                 rate = done / (time.time() - t0)
                 print(f"{done}/{len(todo)}  {rate:.1f}/s", flush=True)
