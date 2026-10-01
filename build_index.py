@@ -9,6 +9,10 @@ Build the offline artwork index consumed by modules/card-scanner (IndexStore.kt)
 
 Outputs (in --out):
   manifest.json   version, counts, model id, sha256 + size of each file
+  hub.bin.gz      f32[count] "hubness" of each row: mean of its top-K cosine similarities to
+                  background queries (art-box crops of real cards, upright AND upside down,
+                  excluding the row's own artwork). The app scores rows as cos − λ·hub (CSLS-like)
+                  so rows that attract everything (text-box-like artworks) stop winning.
   vectors.bin.gz  little-endian:
                     magic "MTGI" | u32 format(1) | u32 count | u32 inDim | u32 dim
                     f32[inDim] pca mean | f32[dim*inDim] pca components (row-major)
@@ -201,6 +205,54 @@ def load_previous(path: str) -> dict | None:
     }
 
 
+HUB_BG_CARDS = int(os.environ.get("HUB_BG_CARDS", "3000"))
+HUB_TOP_K = 10
+
+
+def card_crops(bgr_card: np.ndarray) -> list[np.ndarray]:
+    """The app's art boxes on a 744×1039 card, upright and rotated 180°."""
+    card = cv2.resize(bgr_card, (744, 1039), interpolation=cv2.INTER_AREA)
+    out = []
+    for img in (card, cv2.rotate(card, cv2.ROTATE_180)):
+        for b in range(len(ART_BOXES)):
+            out.append(region(img, f"b{b}"))
+    return out
+
+
+def compute_hub(y: np.ndarray, row_ill: list[str], arts: list[dict], net, mean, comps, workers: int) -> np.ndarray:
+    rng = np.random.default_rng(1234)
+    pick = rng.choice(len(arts), size=min(HUB_BG_CARDS, len(arts)), replace=False)
+    ill_index: dict[str, list[int]] = defaultdict(list)
+    for k, ill in enumerate(row_ill):
+        ill_index[ill].append(k)
+
+    def work(i: int):
+        return i, fetch(front(arts[i])["image_uris"]["normal"])
+
+    qs, owners = [], []
+    with cf.ThreadPoolExecutor(workers) as pool:
+        for i, data in pool.map(work, pick):
+            img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR) if data else None
+            if img is None:
+                continue
+            for crop in card_crops(img):
+                v = embed(net, crop)
+                v /= np.linalg.norm(v) + 1e-12
+                p = (v - mean) @ comps.T
+                qs.append(p / (np.linalg.norm(p) + 1e-12))
+                owners.append(illustration_id(arts[i]))
+    q = np.stack(qs).astype(np.float32)
+    print(f"hubness: {len(q)} background crops from {len(pick)} cards", flush=True)
+    top = np.full((y.shape[0], HUB_TOP_K), -1.0, np.float32)
+    for start in range(0, len(q), 512):
+        sims = y @ q[start : start + 512].T  # (rows, chunk)
+        for j, owner in enumerate(owners[start : start + 512]):
+            sims[ill_index.get(owner, []), j] = -1.0  # never count a row's own artwork
+        both = np.concatenate([top, sims], axis=1)
+        top = -np.partition(-both, HUB_TOP_K - 1, axis=1)[:, :HUB_TOP_K]
+    return top.mean(axis=1).astype(np.float32)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True)
@@ -299,6 +351,13 @@ def main() -> None:
         f.write(scale.astype("<f4").tobytes())
         f.write(q.tobytes())
 
+    y_rows = q.astype(np.float32) * scale[:, None]
+    row_ill = [illustration_id(items[i][0]) for i in keep]
+    hub = compute_hub(y_rows, row_ill, arts, net, mean, comps, args.workers)
+    print(f"hubness p50={np.median(hub):.3f} p99={np.percentile(hub, 99):.3f} max={hub.max():.3f}", flush=True)
+    with gzip.open(os.path.join(args.out, "hub.bin.gz"), "wb", compresslevel=6) as f:
+        f.write(hub.astype("<f4").tobytes())
+
     tsv_path = os.path.join(args.out, "cards.tsv.gz")
     with gzip.open(tsv_path, "wt", encoding="utf-8", compresslevel=6) as f:
         for i in keep:
@@ -320,7 +379,7 @@ def main() -> None:
         "dim": dim,
         "files": {
             name: {"size": os.path.getsize(os.path.join(args.out, name)), "sha256": sha256(os.path.join(args.out, name))}
-            for name in ("vectors.bin.gz", "cards.tsv.gz")
+            for name in ("vectors.bin.gz", "cards.tsv.gz", "hub.bin.gz")
         },
     }
     with open(os.path.join(args.out, "manifest.json"), "w", encoding="utf-8") as f:

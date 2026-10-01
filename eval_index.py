@@ -29,7 +29,11 @@ def load(index_dir):
     scale = np.frombuffer(raw, "<f4", count, o); o += count * 4
     rows = np.frombuffer(raw, np.int8, count * dim, o).reshape(count, dim).astype(np.float32)
     lines = [l.split("\t") for l in gzip.open(f"{index_dir}/cards.tsv.gz", "rt", encoding="utf-8").read().splitlines()]
-    return mean, comps, scale, rows, lines
+    try:
+        hub = np.frombuffer(gzip.open(f"{index_dir}/hub.bin.gz").read(), "<f4").copy()
+    except FileNotFoundError:
+        hub = np.zeros(count, np.float32)
+    return mean, comps, scale, rows, lines, hub
 
 
 def degrade(img, rng):
@@ -52,14 +56,15 @@ def main():
     ap.add_argument("--n", type=int, default=400)
     ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--upside-down", type=float, default=0.25, help="share of queries rotated 180°")
-    ap.add_argument("--strategy", default="C_orient_by_art", help="orientation strategy used for the detailed stats")
+    ap.add_argument("--strategy", default="B:0.75", help="'A|B:lambda' used for the detailed stats")
     a = ap.parse_args()
-    mean, comps, scale, rows, lines = load(a.index)
+    mean, comps, scale, rows, lines, hub = load(a.index)
+    lambdas = (0.0, 0.5, 0.75, 1.0)
     ill = np.array([l[0] for l in lines])
     uniq, row_to_ill = np.unique(ill, return_inverse=True)
     art_rows = [k for k, l in enumerate(lines) if (l[7] if len(l) > 7 else "art") == "art"]
     art_mask = np.zeros(len(lines), bool); art_mask[art_rows] = True
-    strat_ok = {"A_retry_low": 0, "B_both_max": 0, "C_orient_by_art": 0}
+    strat_ok = {f"{st}:{lam}": 0 for st in ("A", "B") for lam in lambdas}
     print(f"index rows {len(lines)}, illustrations {len(uniq)}")
     net = cv2.dnn.readNetFromONNX(a.model)
     s = requests.Session(); s.headers["User-Agent"] = UA
@@ -94,11 +99,12 @@ def main():
         up = scores_for(rgb)
         rot = scores_for(cv2.rotate(rgb, cv2.ROTATE_180))
         ms.append((time.time() - t) * 1000)
-        variants = {
-            "A_retry_low": up if up.max() >= RETRY_BELOW else np.maximum(up, rot),
-            "B_both_max": np.maximum(up, rot),
-            "C_orient_by_art": up if up[art_mask].max() >= rot[art_mask].max() else rot,
-        }
+        variants = {}
+        for lam in lambdas:
+            au, ar = up - lam * hub, rot - lam * hub
+            # A: retry rotated only when the raw upright score is low; B: always both.
+            variants[f"A:{lam}"] = au if up.max() >= RETRY_BELOW else np.maximum(au, ar)
+            variants[f"B:{lam}"] = np.maximum(au, ar)
         if up.max() < RETRY_BELOW:
             retried += 1
         for name_v, sc in variants.items():
@@ -128,7 +134,7 @@ def main():
     print(f"embed+search ms (runner CPU) p50={np.median(ms):.0f} p95={np.percentile(ms, 95):.0f}")
     print("\nFAST PATH (accept without OCR when score>=S and margin>=M):")
     print("   S     M   coverage  wrong-adds")
-    for S in (0.5, 0.55, 0.6, 0.65):
+    for S in (0.3, 0.35, 0.4, 0.45, 0.5, 0.55, 0.6):
         for M in (0.06, 0.08, 0.1, 0.12, 0.15):
             acc = [ok for sc, mg, ok in decisions if sc >= S and mg >= M]
             if acc:
