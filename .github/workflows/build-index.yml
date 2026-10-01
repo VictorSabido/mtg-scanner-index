@@ -55,7 +55,7 @@ jobs:
         run: |
           VERSION=$(python -c "import json;print(json.load(open('dist/manifest.json'))['version'])")
           COUNT=$(python -c "import json;print(json.load(open('dist/manifest.json'))['count'])")
-          gh release create "v$VERSION" dist/manifest.json dist/vectors.bin.gz dist/cards.tsv.gz \
+          gh release create "v$VERSION" dist/* \
             --title "Index $VERSION ($COUNT illustrations)" \
             --notes "Artwork embeddings (art_embed_v1) for $COUNT illustrations, built from Scryfall bulk data." \
             --latest
