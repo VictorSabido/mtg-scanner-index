@@ -52,11 +52,14 @@ def main():
     ap.add_argument("--n", type=int, default=400)
     ap.add_argument("--seed", type=int, default=11)
     ap.add_argument("--upside-down", type=float, default=0.25, help="share of queries rotated 180°")
+    ap.add_argument("--strategy", default="C_orient_by_art", help="orientation strategy used for the detailed stats")
     a = ap.parse_args()
     mean, comps, scale, rows, lines = load(a.index)
     ill = np.array([l[0] for l in lines])
     uniq, row_to_ill = np.unique(ill, return_inverse=True)
     art_rows = [k for k, l in enumerate(lines) if (l[7] if len(l) > 7 else "art") == "art"]
+    art_mask = np.zeros(len(lines), bool); art_mask[art_rows] = True
+    strat_ok = {"A_retry_low": 0, "B_both_max": 0, "C_orient_by_art": 0}
     print(f"index rows {len(lines)}, illustrations {len(uniq)}")
     net = cv2.dnn.readNetFromONNX(a.model)
     s = requests.Session(); s.headers["User-Agent"] = UA
@@ -88,11 +91,21 @@ def main():
             img = cv2.rotate(img, cv2.ROTATE_180); flips += 1
         rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
         t = time.time()
-        best = scores_for(rgb)
-        if best.max() < RETRY_BELOW:
-            retried += 1
-            best = np.maximum(best, scores_for(cv2.rotate(rgb, cv2.ROTATE_180)))
+        up = scores_for(rgb)
+        rot = scores_for(cv2.rotate(rgb, cv2.ROTATE_180))
         ms.append((time.time() - t) * 1000)
+        variants = {
+            "A_retry_low": up if up.max() >= RETRY_BELOW else np.maximum(up, rot),
+            "B_both_max": np.maximum(up, rot),
+            "C_orient_by_art": up if up[art_mask].max() >= rot[art_mask].max() else rot,
+        }
+        if up.max() < RETRY_BELOW:
+            retried += 1
+        for name_v, sc in variants.items():
+            pi = np.full(len(uniq), -9.0, np.float32)
+            np.maximum.at(pi, row_to_ill, sc)
+            strat_ok[name_v] += int(np.argmax(pi) == row_to_ill[r])
+        best = variants[a.strategy]
         # collapse rows -> illustrations
         per_ill = np.full(len(uniq), -9.0, np.float32)
         np.maximum.at(per_ill, row_to_ill, best)
@@ -110,7 +123,8 @@ def main():
             print(f"{k + 1}: top1 {top1} top5 {top5}", flush=True)
     n = len(decisions)
     print(f"\nRESULT n={n} top1={top1} ({100 * top1 / n:.1f}%) top5={top5} ({100 * top5 / n:.1f}%)")
-    print(f"upside-down queries {flips}: top1 {flip_ok}; 180° retries triggered {retried}")
+    print(f"upside-down queries {flips}: top1 {flip_ok}; low-score (<{RETRY_BELOW}) queries {retried}")
+    print("orientation strategies top1:", {k: f"{v}/{n}" for k, v in strat_ok.items()}, f"(detailed: {a.strategy})")
     print(f"embed+search ms (runner CPU) p50={np.median(ms):.0f} p95={np.percentile(ms, 95):.0f}")
     print("\nFAST PATH (accept without OCR when score>=S and margin>=M):")
     print("   S     M   coverage  wrong-adds")

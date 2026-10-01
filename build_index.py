@@ -115,11 +115,12 @@ def illustration_id(card: dict) -> str:
 
 
 def needs_full_card(card: dict) -> bool:
+    # Only layouts whose art really sits elsewhere. Full-art / borderless cards were tried too:
+    # their box rows matched the text box of upside-down cards (hubs), and their art_crop
+    # already covers the art.
     return bool(
         card.get("layout") in FULL_CARD_LAYOUTS
         or "Battle" in (front(card).get("type_line") or card.get("type_line") or "")
-        or card.get("full_art")
-        or card.get("border_color") == "borderless"
     ) and bool((front(card).get("image_uris") or {}).get("normal"))
 
 
