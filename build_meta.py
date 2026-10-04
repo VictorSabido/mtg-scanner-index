@@ -12,6 +12,11 @@ it needs), tab-separated, one record per line; the set names (S lines) go in met
     rarity    c/u/r/m/s/b (common, uncommon, rare, mythic, special, bonus)
     finishes  letters n/f/e (nonfoil, foil, etched)
     name      English name for `en` rows; the printed (localized) name otherwise
+  K \t name \t colors \t color_identity \t type_line   (meta-en only, one per English name)
+    colors          WUBRG letters of the card's colours (front face of double-faced cards)
+    color_identity  WUBRG letters of its colour identity
+    type_line       full type line ("Creature — Human Wizard // Creature — Human Insect")
+  K lines let the app filter by colour and type offline; app versions before them skip them.
 Only paper cards in the layouts the artwork index covers.
 
 Usage: python build_meta.py --out dist
@@ -29,6 +34,7 @@ USER_AGENT = "MTGScannerIndexBuilder/1.0 (github.com/VictorSabido/mtg-scanner-in
 SKIP_LAYOUTS = {"art_series", "token", "double_faced_token", "emblem", "vanguard", "scheme", "planar"}
 RARITY = {"common": "c", "uncommon": "u", "rare": "r", "mythic": "m", "special": "s", "bonus": "b"}
 FINISH = {"nonfoil": "n", "foil": "f", "etched": "e"}
+WUBRG = "WUBRG"
 
 session = requests.Session()
 session.headers.update({"User-Agent": USER_AGENT, "Accept": "application/json;q=0.9,*/*;q=0.8"})
@@ -45,6 +51,21 @@ def printed(c: dict) -> str:
     if faces and all(faces):
         return " // ".join(faces)
     return c["name"]
+
+
+def letters(colors: list | None) -> str:
+    have = set(colors or [])
+    return "".join(c for c in WUBRG if c in have)
+
+
+def card_fields(c: dict) -> tuple:
+    """K record: name, colours (front face of a double-faced card), identity, type line."""
+    faces = c.get("card_faces") or []
+    colors = c.get("colors")
+    if colors is None and faces:
+        colors = faces[0].get("colors")
+    type_line = c.get("type_line") or " // ".join(f.get("type_line", "") for f in faces)
+    return (clean(c["name"]), letters(colors), letters(c.get("color_identity")), clean(type_line))
 
 
 def main() -> None:
@@ -70,6 +91,7 @@ def main() -> None:
 
     sets: dict[str, str] = {}
     rows: list[tuple] = []
+    cards_by_name: dict[str, tuple] = {}
     opener = gzip.open if path.endswith(".gz") else open
     with opener(path, "rt", encoding="utf-8") as f:
         cards = (json.loads(l) for l in f if l.strip()) if ".jsonl" in path else iter(json.load(f))
@@ -80,6 +102,8 @@ def main() -> None:
                 continue
             lang = c.get("lang", "en")
             sets.setdefault(c["set"], c.get("set_name", c["set"].upper()))
+            if lang == "en" and c["name"] not in cards_by_name:
+                cards_by_name[c["name"]] = card_fields(c)
             rows.append((
                 c["set"], c["collector_number"], lang, c["id"],
                 RARITY.get(c.get("rarity", ""), ""),
@@ -98,9 +122,12 @@ def main() -> None:
             if lang == "en":
                 for code, name in sorted(sets.items()):
                     f.write(f"S\t{code}\t{clean(name)}\n")
+                for k in sorted(cards_by_name.values()):
+                    f.write("K\t" + "\t".join(k) + "\n")
             for r in lang_rows:
                 f.write("C\t" + "\t".join(r) + "\n")
         print(f"{lang}: {len(lang_rows)} printings → {out} ({os.path.getsize(out) / 1e6:.2f} MB)")
+    print(f"en: {len(cards_by_name)} cards with colours and type line (K lines)")
 
 
 if __name__ == "__main__":
